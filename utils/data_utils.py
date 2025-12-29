@@ -7,6 +7,7 @@ from torch.utils.data import Dataset
 import os
 import shutil
 import time
+import glob
 
 
 def get_pile(tokenizer, train_size, val_size, seed, seqlen):
@@ -80,26 +81,50 @@ def get_wikitext2(tokenizer, train_size, val_size, seed, seqlen, test_only):
 
 def get_c4(tokenizer, train_size, val_size, seed, seqlen, test_only):
     print("get_c4")
+    cache_dir = os.environ.get("HF_DATASETS_CACHE") or os.environ.get("HF_HOME") or None
+    local_dir = os.environ.get("C4_LOCAL_DIR", None)
+    config_name = os.environ.get("C4_CONFIG", "realnewslike")
+
+    def _try_load_local(path):
+        train_files = sorted(
+            glob.glob(os.path.join(path, "**", "*train*.arrow"), recursive=True)
+        )
+        val_files = sorted(
+            glob.glob(os.path.join(path, "**", "*validation*.arrow"), recursive=True)
+        )
+        if not train_files or not val_files:
+            raise FileNotFoundError(f"No local C4 arrow files found under {path}")
+        data_files = {"train": train_files, "validation": val_files}
+        return (
+            load_dataset("arrow", data_files=data_files, split="train"),
+            load_dataset("arrow", data_files=data_files, split="validation"),
+        )
+
     try:
-        # set local path for faster loading
-        traindata = load_dataset("arrow",
-                    data_files={
-                        "train": "/cpfs01/user/chenmengzhao/huggingface/datasets/allenai___json/allenai--c4-6fbe877195f42de5/0.0.0/0f7e3662623656454fcd2b650f34e886a7db4b9104504885bd462096cc7a9f51/json-train-00000-of-00002.arrow",
-                        "validation": "/cpfs01/user/chenmengzhao/huggingface/datasets/allenai___json/allenai--c4-efc3d4f4606f44bd/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-validation.arrow",
-                    },split='train'
-                    )
-        valdata = load_dataset("arrow",
-                    data_files={
-                        "validation": "/cpfs01/user/chenmengzhao/huggingface/datasets/allenai___json/allenai--c4-efc3d4f4606f44bd/0.0.0/fe5dd6ea2639a6df622901539cb550cf8797e5a6b2dd7af1cf934bed8e233e6e/json-validation.arrow",
-                    },split='validation'
-                    )
-    except:
-        traindata = load_dataset(
-            'allenai/c4', 'allenai--c4', data_files={'train': 'en/c4-train.00000-of-01024.json.gz'}, split='train'
-        )
-        valdata = load_dataset(
-            'allenai/c4', 'allenai--c4', data_files={'validation': 'en/c4-validation.00000-of-00008.json.gz'}, split='validation'
-        )
+        if local_dir:
+            traindata, valdata = _try_load_local(local_dir)
+        else:
+            traindata = load_dataset(
+                "allenai/c4",
+                config_name,
+                split="train",
+                cache_dir=cache_dir,
+                download_mode="reuse_dataset_if_exists",
+            )
+            valdata = load_dataset(
+                "allenai/c4",
+                config_name,
+                split="validation",
+                cache_dir=cache_dir,
+                download_mode="reuse_dataset_if_exists",
+            )
+    except Exception as e:
+        # Fallback: if remote config fails, try local if available; otherwise re-raise with context.
+        if not local_dir:
+            raise RuntimeError(
+                f"Failed to load C4 (config='{config_name}') from cache_dir={cache_dir}"
+            ) from e
+        traindata, valdata = _try_load_local(local_dir)
 
     random.seed(0)
     valenc = []
@@ -107,7 +132,8 @@ def get_c4(tokenizer, train_size, val_size, seed, seqlen, test_only):
         while True:
             i = random.randint(0, len(valdata) - 1)
             tmp = tokenizer(valdata[i]['text'], return_tensors='pt')
-            if tmp.input_ids.shape[1] >= seqlen:
+            # if tmp.input_ids.shape[1] >= seqlen:
+            if tmp.input_ids.shape[1] >= seqlen+1: # jim: to avoid edge case so that random.randint works
                 break
         i = random.randint(0, tmp.input_ids.shape[1] - seqlen - 1)
         j = i + seqlen
@@ -235,6 +261,10 @@ def test_ppl(args, model, tokenizer,prefixed_key_values=None, datasets=['wikitex
             outputs = model(batch,labels=labels, past_key_values=prefixed_key_values)
             neg_log_likelihood = outputs.loss * seqlen
             nlls.append(neg_log_likelihood)
+            batch_ppl = torch.exp(outputs.loss)
+            if i % 5 == 0:
+                ppl = torch.exp(torch.stack(nlls).sum() / ((i+1) * seqlen))
+                print(f'Running PPL after {i+1} batches: {ppl.item()}')
 
         
         ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))

@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from quantize.quantizer import UniformAffineQuantizer
 import utils.hadamard_utils as hadamard_utils
+import matplotlib.pyplot as plt
 
 
 
@@ -16,6 +17,7 @@ class QuantLinear(nn.Module):
     def __init__(
         self,
         org_module: nn.Linear,
+        name: str = "", # jim: added to register the name
     ):
         super().__init__()
         self.fwd_kwargs = dict()
@@ -35,11 +37,33 @@ class QuantLinear(nn.Module):
         self.output_bits = 16
         self.online_full_had=False
         self.use_temporary_parameter=False
+        self.name = name # jim: added to register the name
 
     
     
     def forward(self, input: torch.Tensor):
         input_dtype = input.dtype
+
+        # # jim: inspect layer 1 down projection input
+        # if self.name == "model.layers.1.mlp.down_proj":
+        #     if getattr(self, 'eval_mode', False):
+        #         # plot token-wise max value
+        #         token_max = input.amax(dim=(0, -1)).cpu().numpy()
+        #         plt.figure(figsize=(12, 6))
+        #         plt.plot(token_max, linewidth=1)
+        #         plt.title("Token-wise Max Value before Layer 1 Down Projection")
+        #         plt.xlabel("Token Index")
+        #         plt.ylabel("Max Value")
+        #         plt.savefig("plt/token_max_before_layer1_down_proj.png")
+        #         breakpoint()
+        if getattr(self, 'outlier_token_detection', False):
+            activation_abs = input.abs()
+            activation_abs = activation_abs.max(dim=-1).values
+            ratio = activation_abs / activation_abs.median()
+            outlier_token_ids = (ratio > self.outlier_threshold)
+            # Share outlier_token_ids via the shared state container
+            if hasattr(self, 'outlier_info'):
+                self.outlier_info['outlier_token_ids'] = outlier_token_ids
 
         # Rotate, if needed
         if self.online_full_had:
@@ -62,6 +86,18 @@ class QuantLinear(nn.Module):
             input = self.input_quantizer(input)
 
         out = self.fwd_func(input, weight, bias, **self.fwd_kwargs)
+
+        # jim: add residual template token
+        if getattr(self, 'eval_mode', False) and hasattr(self, 'residual_template_token'):
+            breakpoint()
+            # jim: out shape: (batch_size, seq_len, dim)
+            # Get the online-detected outlier token ids from shared state
+            outlier_token_ids = None
+            if hasattr(self, 'outlier_info') and 'outlier_token_ids' in self.outlier_info:
+                outlier_token_ids = self.outlier_info['outlier_token_ids']
+            # use outlier_token_ids and residual_template_token to modify out
+            if outlier_token_ids is not None:
+                out[outlier_token_ids] += self.residual_template_token
 
         if self.use_act_quant and self.output_bits < 16:
             out = self.output_quantizer(out)

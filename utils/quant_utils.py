@@ -17,7 +17,7 @@ from transformers.models.llama.modeling_llama import repeat_kv
 import math
 
 
-def get_act_stat(model, dataloader, accumulate_type='max', prefixed_tokens=None, online_had=False):
+def get_act_stat(model, dataloader, accumulate_type='max', prefixed_tokens=None, online_had=False, use_insert_quant=False, outlier_threshold=None, template_layer_range=None):
     model.eval()
     num_heads = model.config.num_attention_heads
     num_kv_heads = model.config.num_key_value_heads
@@ -68,6 +68,10 @@ def get_act_stat(model, dataloader, accumulate_type='max', prefixed_tokens=None,
                 y_ = y[:,prefixed_length:, ]
             else:
                 x_,y_ = x, y
+            # jim: remove outliers
+            if getattr(m, 'outlier_info', None) is not None and m.outlier_info.get('outlier_token_ids') is not None:
+                x_[m.outlier_info['outlier_token_ids']] = 0.0
+                y_[m.outlier_info['outlier_token_ids']] = 0.0
             if online_had and 'down_proj' in name:
                 x_ = hadamard_utils.matmul_hadU_cuda(x_, had_K, K)
             stat_tensor(name, x_, 'input')
@@ -81,6 +85,31 @@ def get_act_stat(model, dataloader, accumulate_type='max', prefixed_tokens=None,
                 m.register_forward_hook(
                     functools.partial(stat_input_hook, name=name)))
 
+    # jim: register attributes for outlier token detection 
+    if use_insert_quant:
+        outlier_info = {}
+
+        for name, module in model.named_modules():
+            layer_idx = int(name.split('.')[2]) if 'layers.' in name else -1
+            # register for outlier detection
+            if name.endswith('layers.1.mlp.down_proj'):
+                module.outlier_token_detection = True
+                module.outlier_threshold = outlier_threshold
+                module.outlier_info = outlier_info  # Share the state container
+            # register for down proj (where input quantization is applied)
+            if isinstance(module, int_linear_fake.QuantLinear) and name.endswith('mlp.down_proj'):
+                if layer_idx >= template_layer_range[0] - 1 and layer_idx <= template_layer_range[1] - 1:
+                    module.outlier_info = outlier_info  # Share the state container
+            # register for output proj (where input quantization is applied)
+            if isinstance(module, int_linear_fake.QuantLinear) and name.endswith('self_attn.o_proj'):
+                if layer_idx >= template_layer_range[0] and layer_idx <= template_layer_range[1]:
+                    module.outlier_info = outlier_info  # Share the state container
+            # register for rmsnorm (where output quantization is applied)
+            if isinstance(module, QuantRMSNorm):
+                if layer_idx >= template_layer_range[0] and layer_idx <= template_layer_range[1]:
+                    module.outlier_info = outlier_info  # Share the state container
+            
+
     for i in tqdm(range(len(dataloader)), desc='obtain activation stat'):
         data = dataloader[i][0]
         if prefixed_tokens is not None:
@@ -89,6 +118,20 @@ def get_act_stat(model, dataloader, accumulate_type='max', prefixed_tokens=None,
 
     for h in hooks:
         h.remove()
+
+    # jim: remove outlier detection attributes
+    if use_insert_quant:
+        for name, module in model.named_modules():
+            if name.endswith('layers.1.mlp.down_proj'):
+                module.outlier_token_detection = False
+                module.outlier_threshold = None
+                module.outlier_info = None
+            if isinstance(module, int_linear_fake.QuantLinear) and name.endswith('mlp.down_proj'):
+                module.outlier_info = None
+            if isinstance(module, int_linear_fake.QuantLinear) and name.endswith('self_attn.o_proj'):
+                module.outlier_info = None
+            if isinstance(module, QuantRMSNorm):
+                module.outlier_info = None
 
     return act_stat
 
@@ -105,11 +148,13 @@ def wrap_to_quant_model(model):
         if 'model.norm' in name:
             continue
         if isinstance(module,torch.nn.Linear):
-            quantlinear = int_linear_fake.QuantLinear(module)
+            # quantlinear = int_linear_fake.QuantLinear(module)
+            quantlinear = int_linear_fake.QuantLinear(module, name) # jim: also register the name
             set_op_by_name(model, name, quantlinear)  
             del module  
         elif isinstance(module,(RMSN, LlamaRMSNorm)):
-            quantnorm = QuantRMSNorm(module)
+            # quantnorm = QuantRMSNorm(module)
+            quantnorm = QuantRMSNorm(module, name) # jim: also register the name
             set_op_by_name(model, name, quantnorm)  
             del module 
             

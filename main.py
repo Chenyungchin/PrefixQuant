@@ -23,10 +23,34 @@ def evaluate(model, tokenizer,prefixed_key_values, args, logger):
     device_map = infer_auto_device_map(model, max_memory={i: args.max_memory for i in range(torch.cuda.device_count())}, no_split_module_classes=[block_class_name])
     model = dispatch_model(model, device_map=device_map, skip_keys='past_key_values') # set skip_keys to avoid a bug
     prefixed_key_values = model_utils.mv_kv_cache(prefixed_key_values, model)
+    # jim: set layer 1 down proj to enable outlier token detection
+    # Create a shared state container for cross-module communication
+    if args.use_insert_quant:
+        outlier_info = {}
+        for name, module in model.named_modules():
+            if name.endswith('layers.1.mlp.down_proj'):
+                module.outlier_token_detection = True
+                module.outlier_threshold = args.outlier_threshold
+                module.outlier_info = outlier_info  # Share the state container
+        # jim: set template tokens to each rmsnorm
+        if model.config.template_tokens is not None:
+            for key, val in model.config.template_tokens.items():
+                # set residual template token
+                if key.endswith('_input'):
+                    # set the attribute to down proj and manually do extra residual add in the int_linear_fake forward
+                    down_proj_key = key.rsplit('.',1)[0] + '.mlp.down_proj'
+                    module = model.get_submodule(down_proj_key)
+                    module.residual_template_token = val.to(module.weight.device)
+                    module.outlier_info = outlier_info  # Share the same state container
+                # set rmsnorm output template token
+                else:
+                    module = model.get_submodule(key)
+                    module.template_token = val.to(module.weight.device)
+                    module.outlier_info = outlier_info  # Share the same state container
     results_str=""
     if args.eval_ppl:
-        datasets = ["wikitext2", "c4"]
-        # datasets = ["wikitext2"]
+        # datasets = ["wikitext2", "c4"]
+        datasets = ["wikitext2"]
         ppl_results = test_ppl(args, model, tokenizer, prefixed_key_values, datasets)
         for dataset in ppl_results:
             logger.info(f'{dataset} perplexity: {ppl_results[dataset]:.2f}')
@@ -41,14 +65,22 @@ def evaluate(model, tokenizer,prefixed_key_values, args, logger):
         from lm_eval.models.huggingface import HFLM
         from lm_eval.utils import make_table
         task_list = args.eval_tasks.split(',')
-        model = HFLM(pretrained=model, batch_size=args.eval_batch_size)
+        model = HFLM(pretrained=model, batch_size=args.eval_batch_size, add_bos_token=True) # jim: add_bos_token for testing
         task_manager = lm_eval.tasks.TaskManager()
         results = lm_eval.simple_evaluate(
         model=model,
         tasks=task_list,
         num_fewshot=0,
         task_manager=task_manager,
+        log_samples=True, # jim: log samples for debugging purpose
         )
+
+        # # jim: inspect mmlu_abstract_algebra results
+        # prompt, choice = results['samples']['mmlu_abstract_algebra'][0]['arguments'][0]
+        # enc = tokenizer(prompt, return_tensors="pt")
+        # print(enc.input_ids[0].tolist())
+        # print(tokenizer.convert_ids_to_tokens(enc.input_ids[0]))
+
         logger.info(make_table(results))
         total_acc = 0
         total_acc_with_norm = 0
@@ -117,6 +149,9 @@ def main():
     parser.add_argument("--set_prefixed_tokens", action="store_true")
     parser.add_argument("--outlier_threshold", type=int, default=64, help="\eta in Eq.(3), indicating the oitlier threshold ratio detect outlier tokens, ")
     parser.add_argument("--activation_clipping", action="store_true",help="layer-wise activation clipping for dynamic quantization")
+    # ----------------- InsertQuant setting------------------------------------
+    parser.add_argument("--use_insert_quant", action="store_true", help="use insertQuant for outlier tokens")
+    parser.add_argument("--template_layer_range", type=tuple, default=(2, -2), help="the layer range to insert template tokens")
     # -----------------training setting------------------------------------
     parser.add_argument("--quant_lr", type=float, default=5e-5, help="lr of quantization parameters (s and z)")
     parser.add_argument("--weight_lr", type=float, default=5e-6, help="lr of fp weights")
@@ -214,8 +249,8 @@ def main():
         args.prefixed_length = 0
         activation_stat = None  
         include_static = (args.input_mode == "static" and args.input_bits < 16 ) or (args.kv_mode == "static" and (args.k_bits<16 or args.v_bits<16))            
-        if args.set_prefixed_tokens or include_static:
-            from utils.stat_utils import get_prefixed_tokens
+        if args.set_prefixed_tokens or args.use_insert_quant or include_static:
+            from utils.stat_utils import get_prefixed_tokens, collect_template_tokens
             # model and data prepaer
             if model.device.type == 'cpu':
                 original_device = 'cpu'
@@ -230,12 +265,15 @@ def main():
             train_size=64,
             val_size=0,
             seed=args.seed,
-            seqlen=512,
+            seqlen=2048,
             )
             # get prefixed tokens
             if args.set_prefixed_tokens:
                 tick = time.time()
                 prefixed_tokens = get_prefixed_tokens(cal_dataloader, model, tokenizer, args.model_name, outlier_threshold=args.outlier_threshold, activation_type='down_proj')
+                # jim: try shuffle the prefixed tokens to test robustness
+                random.shuffle(prefixed_tokens)
+                
                 logger.info(f"get {len(prefixed_tokens)} prefixed tokens; token id:{prefixed_tokens}; text: {tokenizer.decode(prefixed_tokens)}")
                 logger.info(f"time to get prefixed token:{time.time()-tick:.0}s")
                 model.config.prefixed_tokens = prefixed_tokens
@@ -248,11 +286,21 @@ def main():
                 output = model(torch.tensor([prefixed_tokens],device=model.device),return_dict=True)
                 prefixed_key_values = output.past_key_values
                 model.config.use_cache = use_cache
+
+            # jim: get template tokens
+            if args.use_insert_quant:
+                if args.template_layer_range[1] < 0:
+                    args.template_layer_range = (args.template_layer_range[0], len(model.model.layers)+args.template_layer_range[1])
+                logger.info(f'InsertQuant: insert template tokens from layer {args.template_layer_range[0]} to layer {args.template_layer_range[1]}')
+                template_tokens = collect_template_tokens(cal_dataloader, model, tokenizer, args.model_name, outlier_threshold=args.outlier_threshold, template_layer_range=args.template_layer_range)
+                model.config.template_tokens = template_tokens
                 
             # get activation statistic for activation quantization
             if include_static:
                 # assert args.input_mode == "static" or args.kv_mode == "static","mse_init require static quantization"
-                activation_stat = get_act_stat(model, cal_dataloader, 'max', prefixed_tokens, args.down_online_had)
+                # activation_stat = get_act_stat(model, cal_dataloader, 'max', prefixed_tokens, args.down_online_had)
+                # jim: pass insertquant info so that outlier tokens will not be counted in activation stat
+                activation_stat = get_act_stat(model, cal_dataloader, 'max', prefixed_tokens, args.down_online_had, use_insert_quant=args.use_insert_quant, outlier_threshold=args.outlier_threshold, template_layer_range=args.template_layer_range)
             if original_device == 'cpu':
                 remove_hook_from_module(model, recurse=True)
                 model = model.cpu()
@@ -325,7 +373,12 @@ def main():
         quant_config['prefixed_tokens'] = prefixed_tokens
         train_utils.save_dict_as_json(quant_config, os.path.join(args.save_quant_dir, 'prefixequant_config.json'))
         logger.info(f"save model to {args.save_quant_dir} success")
-    evaluate(model, tokenizer, prefixed_key_values,  args,logger)
+
+    # jim: set all modules to evaluate mode (for debugging and plotting purpose)
+    for name, module in model.named_modules():
+        module.eval_mode = True
+
+    evaluate(model, tokenizer, prefixed_key_values, args, logger)
 
 
 

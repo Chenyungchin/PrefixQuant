@@ -5,6 +5,7 @@ from quantize.quantizer import UniformAffineQuantizer
 class QuantRMSNorm(nn.Module):
     def __init__(self, 
                 ori_norm,
+                name: str = "", # jim: added to register the name
                 output_bits=16,
                 output_group_size=64,
                 output_mode='dynamic',
@@ -15,6 +16,7 @@ class QuantRMSNorm(nn.Module):
                 ):
         super().__init__()
         self.register_buffer('weight',ori_norm.weight)
+        self.name = name # jim: added to register the name
         self.bias = None
         self.variance_epsilon = ori_norm.variance_epsilon
         self.use_temporary_parameter = False
@@ -43,6 +45,17 @@ class QuantRMSNorm(nn.Module):
         variance = x.pow(2).mean(-1, keepdim=True)
         x = x * torch.rsqrt(variance + self.variance_epsilon)
         x =  x.to(input_dtype) * weight
+
+        # jim: insert template token
+        if getattr(self, 'eval_mode', False) and hasattr(self, 'template_token'):
+            # jim: x shape: (batch_size, seq_len, dim)
+            # Get the online-detected outlier token ids from shared state
+            outlier_token_ids = None
+            if hasattr(self, 'outlier_info') and 'outlier_token_ids' in self.outlier_info:
+                outlier_token_ids = self.outlier_info['outlier_token_ids']
+            # use outlier_token_ids and template_token to modify x
+            if outlier_token_ids is not None:
+                x[outlier_token_ids] = self.template_token
 
         if self.use_act_quant and self.output_bits < 16:
             x = self.output_quantizer(x)

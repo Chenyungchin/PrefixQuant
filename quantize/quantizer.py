@@ -175,7 +175,8 @@ class UniformAffineQuantizer(nn.Module):
             bs, n, dim1 = x.shape
             x_reshaped = x.reshape(bs, n, -1, self.group_size)
 
-
+        # jim: pre-clamp to avoid nan or inf from extreme values 
+        x_reshaped = x_reshaped.clamp(min=-self.qmax * scale, max=self.qmax * scale)
         x_int = round_ste(x_reshaped / scale)
         if round_zero_point is not None:
             x_int = x_int.add(round_zero_point)

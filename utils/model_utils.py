@@ -405,6 +405,8 @@ class WrappedPrefixCausalLM(torch.nn.Module):
         self.model.tie_weights()
 
     def forward(self, *args, **kwargs):
+        # jim: inspect the input sequence here:
+        # breakpoint()
         if kwargs.get("past_key_values") is None:
             if len(args) >= 1:
                 bs = args[0].shape[0]

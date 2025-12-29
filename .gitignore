@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.env
+.venv
+env/
+venv/
+ENV/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Cache files
+cache/
+*.cache
+
+# Logs
+log/
+slurm_log/
+
+# Output plots
+# plt/
+
+# Model weights and checkpoints
+pre_quantized_models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.ckpt
+
+# HuggingFace cache
+.cache/
+
+# Data files (large datasets)
+*.parquet
+*.arrow
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Slurm job files
+*.out
+*.err
+slurm-*.out

@@ -11,4 +11,5 @@ termcolor
 sentencepiece
 protobuf
 matplotlib
-
+# Added to fix compatibility issue
+aiohttp==3.9.5

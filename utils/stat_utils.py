@@ -112,6 +112,70 @@ def stat_layer_wise_outlier_token_number(dataloader, output_activation, model, o
         stats.append(seq_np)
     return stats
 
+def stat_layer_wise_outlier_token_template(dataloader, activation_dict, model, outlier_threshold=50, template_layer_range=(1,-1)):
+    data_num = len(dataloader)
+    template_dict = {}
+    for i in range(data_num):
+        data = dataloader[i][0]
+        with torch.no_grad():
+            model(data.to('cuda'))
+        num_layers = len(model.model.layers)
+        for block_index in range(num_layers):
+            down_proj_entire_name = f'model.layers.{block_index}.mlp.down_proj'
+            pre_attn_entire_name = f'model.layers.{block_index}.input_layernorm'
+            post_attn_entire_name = f'model.layers.{block_index}.post_attention_layernorm'
+            post_attn_input_entire_name = f'model.layers.{block_index}.post_attention_layernorm_input'
+            # identify outlier token ids in layer 1 down proj
+            if block_index == 1:
+                activation_abs = activation_dict[down_proj_entire_name].abs()
+                activation_abs = activation_abs.max(dim=-1).values
+                ratio = activation_abs / activation_abs.median()
+                outlier_token_ids = (ratio > outlier_threshold)
+            # collect outlier token template in rmsnorm output
+            elif block_index >= template_layer_range[0] and block_index <= template_layer_range[1]:
+                pre_attn_template_tokens = activation_dict[pre_attn_entire_name][outlier_token_ids.flatten(), :]
+                post_attn_template_tokens = activation_dict[post_attn_entire_name][outlier_token_ids.flatten(), :]
+                # collect outlier token residual template in rmsnorm input for the outlier cancellation layer
+                if block_index == template_layer_range[1]:
+                    post_attn_input_template_tokens = activation_dict[post_attn_input_entire_name][outlier_token_ids, :]
+
+                # import matplotlib.pyplot as plt
+                # plt.figure(figsize=(12, 6))
+                # plt.subplot(2, 2, 1)
+                # plt.title(f'Layer {block_index} Pre-Attention RMSNorm Template Tokens 1')
+                # plt.plot(pre_attn_template_tokens[0].flatten().cpu().numpy())
+                # plt.subplot(2, 2, 2)
+                # plt.title(f'Layer {block_index} Pre-Attention RMSNorm Template Tokens 2')
+                # plt.plot(pre_attn_template_tokens[1].flatten().cpu().numpy())
+
+                # plt.subplot(2, 2, 3)
+                # plt.title(f'Layer {block_index} Post-Attention RMSNorm Template Tokens 1')
+                # plt.plot(post_attn_template_tokens[0].flatten().cpu().numpy())
+                # plt.subplot(2, 2, 4)
+                # plt.title(f'Layer {block_index} Post-Attention RMSNorm Template Tokens 2')
+                # plt.plot(post_attn_template_tokens[1].flatten().cpu().numpy())
+                # plt.savefig(f'plt/layer_{block_index}_template_tokens.png')
+                # breakpoint()
+
+                # average template over tokens and data samples
+                dtype = pre_attn_template_tokens.dtype
+                if i == 0:
+                    template_dict[pre_attn_entire_name] = pre_attn_template_tokens.mean(dim=0).cpu().to(torch.float32)
+                    template_dict[post_attn_entire_name] = post_attn_template_tokens.mean(dim=0).cpu().to(torch.float32)
+                    if block_index == template_layer_range[1]:
+                        template_dict[post_attn_input_entire_name] = post_attn_input_template_tokens.mean(dim=0).cpu().to(torch.float32)
+                else:
+                    template_dict[pre_attn_entire_name] = (i * template_dict[pre_attn_entire_name] + pre_attn_template_tokens.mean(dim=0).cpu().to(torch.float32)) / (i + 1)
+                    template_dict[post_attn_entire_name] = (i * template_dict[post_attn_entire_name] + post_attn_template_tokens.mean(dim=0).cpu().to(torch.float32)) / (i + 1)
+                    if block_index == template_layer_range[1]:
+                        template_dict[post_attn_input_entire_name] = (i * template_dict[post_attn_input_entire_name] + post_attn_input_template_tokens.mean(dim=0).cpu().to(torch.float32)) / (i + 1)
+
+    # cast back to original dtype
+    for key in template_dict:
+        template_dict[key] = template_dict[key].to(dtype)
+
+    return template_dict
+
 def stat_outlier_token_number(dataloader, output_activation, model, outlier_threshold=50, outlier_object='hidden_state'):
     stats = stat_layer_wise_outlier_token_number(dataloader, output_activation, model, outlier_threshold, outlier_object)
     stats = np.vstack(stats)
@@ -276,6 +340,45 @@ def get_prefixed_tokens(dataloader, model, tokenizer, model_name, outlier_thresh
         h.remove()
     return prefixed_tokens
 
+# jim: for insertQuant
+def collect_template_tokens(dataloader, model, tokenizer, model_name, outlier_threshold=64, template_layer_range=(1,-1)):
+    activation_dict = {}
+    model_family = model_name.split('-')[0].lower()
+    norm_class, decoder_class = get_nrom_and_decoder_class(model_family, model)
+    down_proj_name = get_down_proj_name(model_family)
+    
+    from quantize.int_linear_fake import QuantLinear
+    from quantize.quant_norm import QuantRMSNorm
+    target_linear_class = (torch.nn.Linear, QuantLinear)
+    target_norm_class = (norm_class, QuantRMSNorm)
+    
+    hooks = []
+    for name, layer in model.named_modules():
+        # print(name, layer.__class__)
+        # hook for layer 1 down proj
+        if isinstance(layer, target_linear_class) and down_proj_name in name:
+            if 'layers.1.' in name:
+                pass
+            else:
+                continue
+            hooks.append(layer.register_forward_hook(get_activation_hook_2(name, activation_dict, is_input=True)))
+        # hook for rmsnorm
+        elif norm_class is not None and isinstance(layer, target_norm_class):
+            # hook for rmsnorm output (for inserting standard rmsnorm template)
+            layer_index = int(name.split('.')[2]) if 'layers.' in name else -1
+            if layer_index >= template_layer_range[0] and layer_index <= template_layer_range[1]:
+                pass
+            else:
+                continue
+            hooks.append(layer.register_forward_hook(get_activation_hook_2(name, activation_dict, is_input=False)))
+            # hook for rmsnorm input (for inserting residual template only in the outlier cancellation layer)
+            if layer_index == template_layer_range[1] and 'post_attention_layernorm' in name:
+                hooks.append(layer.register_forward_hook(get_activation_hook_2(name + '_input', activation_dict, is_input=True)))
+        
+    templates = stat_layer_wise_outlier_token_template(dataloader, activation_dict, model, outlier_threshold, template_layer_range)
+    for h in hooks:
+        h.remove()
+    return templates
 
 def get_input_modify_hook(modified_index, prefixed_tokens_num=0):
     def hook(model, input):
